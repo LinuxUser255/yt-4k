@@ -20,6 +20,9 @@ A `yt-dlp` wrapper for downloading 4K video, best-quality video or audio, includ
 
 ## Install
 
+```bash
+curl -LO https://raw.githubusercontent.com/LinuxUser255/yt-4k/refs/heads/main/yt4k
+```
 - Make it executable: `chmod +x yt4k`
 - Put it on your `PATH`: `sudo mv yt4k /usr/local/bin/`
 - Check it: `yt4k --help`
