@@ -21,11 +21,14 @@
 #   alias ytb='yt4k -b -i '                 # best quality, video ID in filename
 #
 # COOKIES / AGE-RESTRICTED VIDEOS
-#   YouTube's bot check ("Sign in to confirm you're not a bot") and its age
-#   gate both need cookies from a logged-in browser. For YouTube URLs this
-#   script passes Brave's cookies automatically, so age-restricted videos
-#   download as long as that browser profile is signed in to an age-verified
-#   account. Pick a specific profile with --profile / YT4K_BROWSER_PROFILE.
+#   By default this script does NOT touch your browser or any other file of
+#   yours: every download is first attempted with no cookies at all. Only if
+#   yt-dlp reports that YouTube demands a login (the age gate, the "Sign in
+#   to confirm you're not a bot" check, private or members-only videos) is
+#   the download retried with Brave's cookies. That profile must be signed
+#   in to an age-verified account for age-restricted videos. Pick a profile
+#   with --profile / YT4K_BROWSER_PROFILE. Use --cookies-always to read the
+#   browser up front, or --no-cookies to guarantee it is never read.
 #   Reading the browser profile on macOS requires the terminal to have Full
 #   Disk Access; without it yt-dlp reports the misleading "could not find
 #   brave cookies database". On Linux the profile is found under ~/.config
@@ -52,12 +55,16 @@ OUTPUT_TEMPLATE_ID='%(title)s [%(id)s].%(ext)s'
 # Retries per download. Empty keeps yt-dlp's own default (10).
 RETRIES="${YT4K_RETRIES:-}"
 
-# Cookie settings. Cookies are sent only to YouTube URLs by default so that an
-# unrelated site never receives your browser's cookie jar.
+# Cookie settings. The browser is never read unless a download fails because
+# the video requires a login (auto), or you ask for it (always). In auto mode
+# only YouTube URLs can trigger that fallback, so an unrelated site never
+# receives your browser's cookie jar.
 BROWSER="${YT4K_BROWSER:-brave}"
 BROWSER_PROFILE="${YT4K_BROWSER_PROFILE:-}"            # empty = yt-dlp picks the profile
 COOKIES_FILE="${YT4K_COOKIES:-}"
 USE_COOKIES="${YT4K_COOKIES_MODE:-auto}"               # auto | always | never
+TARGET_URL=""                                          # set in main; read by the cookie fallback
+YTDLP_STDERR=""                                        # stderr of the last yt-dlp attempt
 
 COOKIE_ARGS=()                                         # §8 populated by setup_cookies
 COOKIE_SOURCE="none"                                   # none | file | browser
@@ -250,7 +257,7 @@ profile_is_readable() {
 
 warn_no_profile_access() {
         local root="${1}"
-        print_warning "Cannot read ${BROWSER}'s profile — continuing without cookies."
+        print_warning "Cannot read ${BROWSER}'s profile — no cookies available."
         if is_macos; then
                 print_warning "macOS is blocking it: ${root}"
                 print_warning "Grant Full Disk Access to ${TERM_PROGRAM:-your terminal}, then reopen it:"
@@ -289,21 +296,23 @@ browser_is_running() {
         return 1
 }
 
+# Decide what to send on the FIRST attempt. In the default auto mode that is
+# nothing: this function then reads no file and inspects no browser.
 setup_cookies() {
-        local url="${1}"
-        local root=""
-        local profile=""
-        local spec=""
-
         COOKIE_ARGS=()
         COOKIE_SOURCE="none"
+
+        case "${USE_COOKIES}" in
+        auto|always|never) ;;
+        *) die "Invalid YT4K_COOKIES_MODE: ${USE_COOKIES} (expected auto, always or never)" ;;
+        esac
 
         if [[ "${USE_COOKIES}" == "never" ]]; then
                 debug "cookies disabled"
                 return 0
         fi
 
-        # An explicit cookie file wins and needs no browser access at all.
+        # An explicit cookie file was asked for, and needs no browser access.
         if [[ -n "${COOKIES_FILE}" ]]; then
                 if [[ ! -r "${COOKIES_FILE}" ]]; then
                         die "Cookie file not readable: ${COOKIES_FILE}"
@@ -314,11 +323,22 @@ setup_cookies() {
                 return 0
         fi
 
-        # Default: only YouTube gets the browser cookie jar.
-        if [[ "${USE_COOKIES}" == "auto" ]] && ! is_youtube_url "${url}"; then
-                debug "non-YouTube URL: skipping browser cookies"
+        if [[ "${USE_COOKIES}" == "always" ]]; then
+                setup_browser_cookies || true
                 return 0
         fi
+
+        debug "auto mode: first attempt without cookies, browser untouched"
+        return 0                                       # §2 &&-trap
+}
+
+# Point COOKIE_ARGS at the browser profile. This is the only code path that
+# looks at the browser. Returns 1 (after a warning) if the profile is
+# unavailable.
+setup_browser_cookies() {
+        local root=""
+        local profile=""
+        local spec=""
 
         # yt-dlp syntax is BROWSER[:PROFILE], where PROFILE is a name or a path;
         # without one it picks a profile from the standard location itself.
@@ -333,7 +353,7 @@ setup_cookies() {
                 root="$(browser_profile_root "${BROWSER}")"
                 if ! profile_is_readable "${root}"; then
                         warn_no_profile_access "${root}"
-                        return 0
+                        return 1
                 fi
                 # Flatpak/Snap roots are invisible to yt-dlp unless passed as a path.
                 if [[ -n "${root}" && "${root}" != "$(browser_profile_standard_root "${BROWSER}")" ]]; then
@@ -373,22 +393,67 @@ print_failure_hints() {
         if [[ "${COOKIE_SOURCE}" == "browser" ]] && browser_is_running "${BROWSER}"; then
                 print_warning "${BROWSER} is running. If the error mentions 'database is locked', quit it and re-run."
         fi
-        if [[ "${COOKIE_SOURCE}" == "none" ]]; then
-                print_warning "No cookies were sent. Age-restricted and bot-checked videos need them (see --help, COOKIES)."
-        else
+        if [[ "${COOKIE_SOURCE}" != "none" ]]; then
                 print_warning "Age-restricted videos need those cookies to come from a signed-in, age-verified account."
+        elif needs_login; then
+                print_warning "This video requires a login and no cookies were sent (see --help, COOKIES)."
         fi
         print_warning "An outdated yt-dlp is the other usual cause: yt-dlp -U (or brew upgrade yt-dlp)"
         return 0                                       # §2 &&-trap
 }
 
+# True if the last yt-dlp attempt failed because the site demands a login:
+# age gate, bot check, private or members-only video. yt-dlp appends its
+# "--cookies-from-browser" advice to such errors, which is the surest sign.
+needs_login() {
+        local err=""
+        err="$(printf '%s' "${YTDLP_STDERR}" | tr '[:upper:]' '[:lower:]')"
+        case "${err}" in
+        *"--cookies-from-browser"*|*"sign in to confirm"*|*"age-restricted"*|*"age restricted"*) return 0 ;;
+        *"login required"*|*"private video"*|*"members-only"*|*"available to this channel's members"*) return 0 ;;
+        *) return 1 ;;
+        esac
+}
+
+# One yt-dlp run. stdout (progress, format tables) goes straight to the
+# terminal; stderr is shown as usual and also kept in YTDLP_STDERR, in memory
+# only, so needs_login can inspect it. Returns yt-dlp's exit status.
+ytdlp_attempt() {
+        local status=0
+        local line=""
+
+        debug "yt-dlp ${COOKIE_ARGS[*]+${COOKIE_ARGS[*]}} $*"
+        {
+                YTDLP_STDERR="$(
+                        yt-dlp ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} "$@" 2>&1 >&3 3>&- |
+                                while IFS= read -r line || [[ -n "${line}" ]]; do
+                                        printf '%s\n' "${line}" >&2
+                                        printf '%s\n' "${line}"
+                                done
+                )" || status=$?
+        } 3>&1
+        return "${status}"
+}
+
 # Every yt-dlp invocation goes through here so cookies and failure hints are
-# applied uniformly. Returns yt-dlp's exit status.
+# applied uniformly. In auto mode the first attempt sends no cookies; the
+# browser is consulted only if that attempt fails with a login demand.
+# Returns yt-dlp's exit status.
 run_ytdlp() {
         local status=0
 
-        debug "yt-dlp ${COOKIE_ARGS[*]+${COOKIE_ARGS[*]}} $*"
-        yt-dlp ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} "$@" || status=$?
+        ytdlp_attempt "$@" || status=$?
+
+        if [[ "${status}" -ne 0 && "${USE_COOKIES}" == "auto" && "${COOKIE_SOURCE}" == "none" ]] &&
+                is_youtube_url "${TARGET_URL}" && needs_login; then
+                printf '\n'
+                print_warning "This video requires a login. Retrying with ${BROWSER}'s cookies (--no-cookies prevents this)."
+                if setup_browser_cookies; then
+                        status=0
+                        ytdlp_attempt "$@" || status=$?
+                fi
+        fi
+
         if [[ "${status}" -ne 0 ]]; then
                 print_failure_hints "${status}"
         fi
@@ -481,7 +546,8 @@ usage() {
 Usage: ${0##*/} [OPTIONS] <URL> [OUTPUT_DIR]
 
 Download 4K videos, best-quality videos or audio using yt-dlp.
-Age-restricted YouTube videos work via your browser's cookies.
+Your browser is not touched unless a YouTube video demands a login
+(e.g. age-restricted); only then is the download retried with its cookies.
 
 DOWNLOAD MODES (default: best quality up to ${MAX_HEIGHT}p, merged to MP4):
     --4k                    The default mode, accepted for explicitness
@@ -499,12 +565,15 @@ OUTPUT:
     --retries N             Retries per download (default: yt-dlp's own, 10)
 
 COOKIES:
-    --browser NAME          Browser to read cookies from (default: ${BROWSER})
+    By default no cookies are read. If YouTube refuses a video because it
+    requires a login, the download is retried with the browser's cookies.
+
+    --browser NAME          Browser to read if cookies are needed (default: ${BROWSER})
     --profile NAME          Browser profile to read, e.g. Default, "Profile 1",
                             or a full path to a profile directory
-    --cookies FILE          Use a Netscape cookies.txt instead of the browser
-    --cookies-always        Send browser cookies to any site, not just YouTube
-    --no-cookies            Do not send cookies at all
+    --cookies FILE          Use a Netscape cookies.txt; the browser is never read
+    --cookies-always        Read browser cookies up front, for any site
+    --no-cookies            Never read or send cookies, even if a video needs them
 
     -h, --help              Show this help message
 
@@ -514,21 +583,23 @@ ENVIRONMENT VARIABLES:
     YT4K_MAX_HEIGHT         Maximum video height (default: 2160)
     YT4K_AUDIO_FORMAT       Default audio format (default: wav)
     YT4K_RETRIES            Retries per download
-    YT4K_BROWSER            Browser to read cookies from (default: brave)
+    YT4K_BROWSER            Browser to read if cookies are needed (default: brave)
     YT4K_BROWSER_PROFILE    Browser profile to read cookies from
     YT4K_COOKIES            Path to a cookies.txt; skips the browser entirely
-    YT4K_COOKIES_MODE       auto (YouTube only, default) | always | never
+    YT4K_COOKIES_MODE       auto (default: only when a YouTube video demands
+                            a login) | always | never
     DEBUG=1                 Print the yt-dlp command line and other details
 
 COOKIES AND AGE-RESTRICTED VIDEOS:
-    YouTube's bot check and age gate need cookies from a logged-in browser.
-    For YouTube URLs these are read from ${BROWSER} automatically, so
-    age-restricted videos download as long as that profile is signed in to
-    an age-verified account. On macOS this requires Full Disk Access for
-    your terminal; without it the download continues without cookies and a
-    warning explains how to fix it. If extraction fails with "database is
-    locked", quit the browser and re-run. On Linux the profile is read
-    from ~/.config (or XDG_CONFIG_HOME), or from a Flatpak or Snap install.
+    Every download is first tried without cookies, and the browser is left
+    alone. Only when YouTube answers with a login demand (age gate, bot
+    check, private or members-only video) is the download retried with
+    cookies read from ${BROWSER}; that profile must be signed in to an
+    age-verified account. On macOS reading it requires Full Disk Access for
+    your terminal; without it a warning explains how to fix it. If
+    extraction fails with "database is locked", quit the browser and
+    re-run. On Linux the profile is read from ~/.config (or
+    XDG_CONFIG_HOME), or from a Flatpak or Snap install.
 
 EXAMPLES:
     ${0##*/} "https://youtube.com/watch?v=VIDEO_ID"
@@ -700,7 +771,8 @@ main() {
                 die "Invalid retries value: ${RETRIES} (expected a number or 'infinite')"
         fi
 
-        setup_cookies "${url}"
+        TARGET_URL="${url}"
+        setup_cookies
 
         if [[ "${show_formats_only}" == true ]]; then
                 show_formats "${url}"

@@ -1,14 +1,15 @@
 
 ![yt-4k-logo.jpg](images/yt-4k-logo.jpg)
 
-A `yt-dlp` wrapper for downloading 4K video, best-quality video or audio, including age-restricted YouTube videos via your browser's cookies.
+A `yt-dlp` wrapper for downloading 4K video, best-quality video or audio, including age-restricted YouTube videos. Your browser's cookies are read only when a video actually requires a login.
 
 ## Features
 
 - 4K by default: best quality up to 2160p, merged to MP4
 - Best-quality, exact-2160p, MP4-preferred and audio-only modes
-- Age-restricted and bot-checked YouTube videos, using cookies from Brave (or another browser)
-- Cookies go to YouTube URLs only, unless you say otherwise
+- Does not touch your browser by default: every download is first tried without cookies
+- Age-restricted, bot-checked, private and members-only YouTube videos are retried with cookies from Brave (or another browser), only when YouTube demands a login
+- `--no-cookies` guarantees the browser is never read; `--cookies-always` reads it up front
 - Works on macOS and Linux, including Flatpak and Snap browser installs
 - Hints on failure: locked cookie database, missing cookies, outdated `yt-dlp`
 
@@ -55,16 +56,17 @@ yt4k [OPTIONS] <URL> [OUTPUT_DIR]
 - `YT4K_MAX_HEIGHT` — maximum video height (default `2160`)
 - `YT4K_AUDIO_FORMAT` — default audio format (default `wav`)
 - `YT4K_RETRIES` — retries per download (default: `yt-dlp`'s own)
-- `YT4K_BROWSER` — browser to read cookies from (default `brave`)
+- `YT4K_BROWSER` — browser to read if cookies are needed (default `brave`)
 - `YT4K_BROWSER_PROFILE` — browser profile name or path
 - `YT4K_COOKIES` — path to a `cookies.txt`; skips the browser entirely
-- `YT4K_COOKIES_MODE` — `auto` (YouTube only, default), `always` or `never`
+- `YT4K_COOKIES_MODE` — `auto` (default: browser read only when a YouTube video demands a login), `always` or `never`
 - `DEBUG=1` — print the `yt-dlp` command line
 
 ## Cookies and age-restricted videos
 
+- By default no cookies are read and the browser is not touched; the download is retried with browser cookies only if YouTube refuses it with a login demand
 - The browser profile must be signed in to an age-verified YouTube account
-- **macOS:** the terminal needs Full Disk Access to read the browser profile; without it the download continues without cookies and a warning explains the fix
+- **macOS:** the terminal needs Full Disk Access to read the browser profile; without it a warning explains the fix
 - **Linux:** the profile is read from `~/.config` (or `XDG_CONFIG_HOME`), or from a Flatpak or Snap install
 - If the profile lives elsewhere, pass its path with `--profile /path/to/profile`
 - If extraction fails with "database is locked", quit the browser and re-run
