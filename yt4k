@@ -1,0 +1,739 @@
+#!/usr/bin/env bash
+# =============================================================================
+# SCRIPT:       yt4k
+# DESCRIPTION:  Download 4K videos, best-quality videos or audio using yt-dlp,
+#               including age-restricted videos (via browser cookies).
+# USAGE:        ./yt4k [OPTIONS] <URL> [OUTPUT_DIR]
+# DEPENDENCIES: yt-dlp (required), ffmpeg (needed to merge/convert streams)
+# LICENSE:      GNU GPL v3.0 (see LICENSE)
+# -----------------------------------------------------------------------------
+# INSTALL
+#   curl -LO https://gitlab.com/LinuxUser255/
+#   chmod +x yt4k
+#   sudo mv yt4k /usr/local/bin/       # makes it globally executable
+#
+# QUICK START
+#   ./yt4k --help
+#
+# RECOMMENDED ALIASES  (~/.bashrc or ~/.zshrc)
+#   alias yt='yt4k '                        # enforce 4K video downloads
+#   alias yta='yt4k -a --audio-format wav ' # enforce wav audio downloads
+#   alias ytb='yt4k -b -i '                 # best quality, video ID in filename
+#
+# COOKIES / AGE-RESTRICTED VIDEOS
+#   YouTube's bot check ("Sign in to confirm you're not a bot") and its age
+#   gate both need cookies from a logged-in browser. For YouTube URLs this
+#   script passes Brave's cookies automatically, so age-restricted videos
+#   download as long as that browser profile is signed in to an age-verified
+#   account. Pick a specific profile with --profile / YT4K_BROWSER_PROFILE.
+#   Reading the browser profile on macOS requires the terminal to have Full
+#   Disk Access; without it yt-dlp reports the misleading "could not find
+#   brave cookies database". On Linux the profile is found under ~/.config
+#   (or XDG_CONFIG_HOME), and Flatpak and Snap installs are detected too.
+# =============================================================================
+set -euo pipefail                                      # §1 strict-mode
+IFS=$'\n\t'                                            # §1 strict-mode
+
+# =============================================================================
+# CONFIGURATION — Set defaults here.
+# =============================================================================
+
+# OUTPUT_DIR defaults to your current working directory
+OUTPUT_DIR="${YT4K_OUTPUT_DIR:-${PWD}}"                # §5 no-fork: ${PWD} replaces $(pwd)
+MAX_HEIGHT="${YT4K_MAX_HEIGHT:-2160}"
+# Default audio format is wav because it's the highest quality audio format
+AUDIO_FORMAT="${YT4K_AUDIO_FORMAT:-wav}"
+DEBUG="${DEBUG:-0}"                                    # §2 required for debug()
+
+# Output filename templates (yt-dlp syntax). --id switches to the second one.
+OUTPUT_TEMPLATE="${YT4K_OUTPUT_TEMPLATE:-%(title)s.%(ext)s}"
+OUTPUT_TEMPLATE_ID='%(title)s [%(id)s].%(ext)s'
+
+# Retries per download. Empty keeps yt-dlp's own default (10).
+RETRIES="${YT4K_RETRIES:-}"
+
+# Cookie settings. Cookies are sent only to YouTube URLs by default so that an
+# unrelated site never receives your browser's cookie jar.
+BROWSER="${YT4K_BROWSER:-brave}"
+BROWSER_PROFILE="${YT4K_BROWSER_PROFILE:-}"            # empty = yt-dlp picks the profile
+COOKIES_FILE="${YT4K_COOKIES:-}"
+USE_COOKIES="${YT4K_COOKIES_MODE:-auto}"               # auto | always | never
+
+COOKIE_ARGS=()                                         # §8 populated by setup_cookies
+COOKIE_SOURCE="none"                                   # none | file | browser
+DOWNLOAD_ARGS=()                                       # §8 populated by setup_download_args
+
+# =============================================================================
+# COLORS
+# =============================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'                                           # §13 removed BLUE: unused (SC2034)
+[[ -t 1 ]] || { RED=''; GREEN=''; YELLOW=''; NC=''; }  # §11 suppress when not a terminal
+readonly RED GREEN YELLOW NC                           # §8 constants
+readonly OUTPUT_DIR MAX_HEIGHT AUDIO_FORMAT            # §8 constants
+readonly OUTPUT_TEMPLATE OUTPUT_TEMPLATE_ID            # §8 constants
+
+# =============================================================================
+# BANNER
+# =============================================================================
+
+show_banner() {
+        printf '\n'                                    # §7 printf not echo; §11 indentation 8sp
+        printf '%b\n' "  \033[1;37m██   ██ ████████  \033[1;31m██████   ██       ██████  \033[0m"  # §7 §11
+        printf '%b\n' "  \033[1;37m██   ██    ██     \033[1;31m██   ██  ██       ██   ██ \033[0m"  # §7 §11
+        printf '%b\n' "  \033[1;37m███ ███    ██     \033[1;31m██   ██  ██       ██   ██ \033[0m"  # §7 §11
+        printf '%b\n' "  \033[1;37m █████     ██     \033[1;31m██   ██  ██       ██████  \033[0m"  # §7 §11
+        printf '%b\n' "  \033[1;37m  ███      ██     \033[1;31m██   ██  ██       ██      \033[0m"  # §7 §11
+        printf '%b\n' "  \033[1;37m   ██      ██     \033[1;31m██   ██  ██       ██      \033[0m"  # §7 §11
+        printf '%b\n' "  \033[1;37m   ██      ██     \033[1;31m██████   ███████  ██      \033[0m"  # §7 §11
+        printf '\n'                                    # §7 printf not echo
+        printf '%b\n' "          \033[1;37m██  ████   \033[1;31m██  ██  ██  ██\033[0m"             # §7 §11
+        printf '%b\n' "          \033[1;37m██  ██ ██  \033[1;31m██  ██  ██ ██ \033[0m"             # §7 §11
+        printf '%b\n' "          \033[1;37m██  ██  ██ \033[1;31m██████  ████  \033[0m"             # §7 §11
+        printf '%b\n' "          \033[1;37m██  ██   ██    \033[1;31m██  ██ ██ \033[0m"             # §7 §11
+        printf '\n'                                    # §7 printf not echo
+        printf '%b\n' "                \033[1;37m>_\033[1;31mdlp \033[1;37min \033[1;31m4K\033[0m" # §7 §11
+        printf '\n'                                    # §7 printf not echo
+        return 0                                       # §2 &&-trap
+}
+
+# =============================================================================
+# UTILS
+# =============================================================================
+
+print_info() {
+        printf '%b\n' "${GREEN}[INFO]${NC} ${1}"       # §11 printf '%b\n' color format
+        return 0                                       # §2 &&-trap
+}
+
+print_warning() {
+        printf '%b\n' "${YELLOW}[WARN]${NC} ${1}"      # §11 printf '%b\n' color format
+        return 0                                       # §2 &&-trap
+}
+
+print_error() {
+        printf '%b\n' "${RED}[ERROR]${NC} ${1}" >&2    # §11 printf '%b\n' color format
+        return 0                                       # §2 &&-trap
+}
+
+debug() {
+        [[ "${DEBUG:-0}" == 1 ]] && printf '[DEBUG] %s\n' "$*"  # §2 safe &&-chain
+        return 0                                       # §2 &&-trap: load-bearing
+}
+
+die() {
+        print_error "${1}"
+        exit 1
+}
+
+# =============================================================================
+# VALIDATION
+# =============================================================================
+
+check_requirements() {
+        debug "check_requirements called"
+        if ! command -v yt-dlp &>/dev/null; then       # §4 command -v only
+                if command -v brew &>/dev/null; then
+                        die "yt-dlp is not installed. Install with: brew install yt-dlp"
+                fi
+                die "yt-dlp is not installed. Install with: pip install yt-dlp"
+        fi
+        if ! command -v ffmpeg &>/dev/null; then
+                print_warning "ffmpeg not found: merging video+audio and audio conversion will fail."
+        fi
+        return 0                                       # §2 &&-trap
+}
+
+validate_url() {
+        local url="${1:-}"                             # §8 ${var:-default} safe under set -u
+        if [[ -z "${url}" ]]; then
+                return 1
+        fi
+        # Basic URL validation
+        if [[ "${url}" =~ ^https?:// ]]; then
+                return 0
+        fi
+        return 1
+}
+
+is_youtube_url() {
+        local url="${1:-}"
+        [[ "${url}" == *"youtube.com"* || "${url}" == *"youtu.be"* ]]
+}
+
+# =============================================================================
+# COOKIES
+# =============================================================================
+
+is_macos() {
+        [[ "${OSTYPE:-}" == darwin* ]]
+}
+
+# Candidate profile roots for the Chromium-based browsers, one per line. The
+# first line is the standard location, which is where yt-dlp looks on its
+# own; later lines (Linux Flatpak and Snap installs) are ones yt-dlp only
+# finds when given the path. No output means "unknown browser": the access
+# preflight is skipped and yt-dlp is left to locate the profile itself.
+browser_profile_candidates() {
+        local config="${XDG_CONFIG_HOME:-${HOME}/.config}"
+        local flatpak="${HOME}/.var/app"
+
+        if is_macos; then
+                case "${1}" in
+                brave)    printf '%s\n' "${HOME}/Library/Application Support/BraveSoftware/Brave-Browser" ;;
+                chromium) printf '%s\n' "${HOME}/Library/Application Support/Chromium" ;;
+                chrome)   printf '%s\n' "${HOME}/Library/Application Support/Google/Chrome" ;;
+                *)        ;;
+                esac
+                return 0
+        fi
+
+        case "${1}" in
+        brave)
+                printf '%s\n' \
+                        "${config}/BraveSoftware/Brave-Browser" \
+                        "${flatpak}/com.brave.Browser/config/BraveSoftware/Brave-Browser" \
+                        "${HOME}/snap/brave/current/.config/BraveSoftware/Brave-Browser"
+                ;;
+        chromium)
+                printf '%s\n' \
+                        "${config}/chromium" \
+                        "${flatpak}/org.chromium.Chromium/config/chromium" \
+                        "${HOME}/snap/chromium/common/chromium"
+                ;;
+        chrome)
+                printf '%s\n' \
+                        "${config}/google-chrome" \
+                        "${flatpak}/com.google.Chrome/config/google-chrome"
+                ;;
+        *)      ;;
+        esac
+        return 0                                       # §2 &&-trap
+}
+
+# The first candidate that exists, else the standard location (so warnings
+# can name it), else empty for an unknown browser.
+browser_profile_root() {
+        local candidate=""
+        local standard=""
+
+        while IFS= read -r candidate; do
+                [[ -n "${standard}" ]] || standard="${candidate}"
+                if [[ -e "${candidate}" ]]; then
+                        printf '%s' "${candidate}"
+                        return 0
+                fi
+        done < <(browser_profile_candidates "${1}")
+        printf '%s' "${standard}"
+        return 0                                       # §2 &&-trap
+}
+
+# The standard location only: the one yt-dlp searches without being told.
+browser_profile_standard_root() {
+        local standard=""
+        IFS= read -r standard < <(browser_profile_candidates "${1}") || true
+        printf '%s' "${standard}"
+        return 0                                       # §2 &&-trap
+}
+
+# macOS can allow stat() on a protected path while denying opendir(). yt-dlp
+# locates the cookie DB by walking the profile, so the walk is what matters.
+profile_is_readable() {
+        local root="${1}"
+        [[ -n "${root}" ]] || return 0                 # unknown browser: let yt-dlp try
+        [[ -e "${root}" ]] || return 1
+        ls "${root}" >/dev/null 2>&1
+}
+
+warn_no_profile_access() {
+        local root="${1}"
+        print_warning "Cannot read ${BROWSER}'s profile — continuing without cookies."
+        if is_macos; then
+                print_warning "macOS is blocking it: ${root}"
+                print_warning "Grant Full Disk Access to ${TERM_PROGRAM:-your terminal}, then reopen it:"
+                print_warning "  open 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'"
+        elif [[ -e "${root}" ]]; then
+                print_warning "Permission denied: ${root}"
+        else
+                print_warning "Not found: ${root} (nor a Flatpak or Snap install of ${BROWSER})"
+                print_warning "If the profile lives elsewhere, pass its path: --profile /path/to/profile"
+        fi
+        print_warning "Or export a cookies.txt and use: YT4K_COOKIES=~/yt-cookies.txt"
+        return 0                                       # §2 &&-trap
+}
+
+# Process names (macOS and Linux) for the browser, one per line.
+browser_process_names() {
+        case "${1}" in
+        brave)    printf '%s\n' "Brave Browser" "brave" "brave-browser" ;;
+        chrome)   printf '%s\n' "Google Chrome" "chrome" "google-chrome" ;;
+        chromium) printf '%s\n' "Chromium" "chromium" ;;
+        firefox)  printf '%s\n' "firefox" "Firefox" ;;
+        *)        ;;
+        esac
+        return 0                                       # §2 &&-trap
+}
+
+# yt-dlp reads the browser's cookie database directly. If the browser is
+# running, the DB can be locked and extraction fails intermittently.
+browser_is_running() {
+        local name=""
+        while IFS= read -r name; do
+                if pgrep -x "${name}" >/dev/null 2>&1; then
+                        return 0
+                fi
+        done < <(browser_process_names "${1}")
+        return 1
+}
+
+setup_cookies() {
+        local url="${1}"
+        local root=""
+        local profile=""
+        local spec=""
+
+        COOKIE_ARGS=()
+        COOKIE_SOURCE="none"
+
+        if [[ "${USE_COOKIES}" == "never" ]]; then
+                debug "cookies disabled"
+                return 0
+        fi
+
+        # An explicit cookie file wins and needs no browser access at all.
+        if [[ -n "${COOKIES_FILE}" ]]; then
+                if [[ ! -r "${COOKIES_FILE}" ]]; then
+                        die "Cookie file not readable: ${COOKIES_FILE}"
+                fi
+                COOKIE_ARGS=(--cookies "${COOKIES_FILE}")
+                COOKIE_SOURCE="file"
+                print_info "Cookies: file ${COOKIES_FILE}"
+                return 0
+        fi
+
+        # Default: only YouTube gets the browser cookie jar.
+        if [[ "${USE_COOKIES}" == "auto" ]] && ! is_youtube_url "${url}"; then
+                debug "non-YouTube URL: skipping browser cookies"
+                return 0
+        fi
+
+        # yt-dlp syntax is BROWSER[:PROFILE], where PROFILE is a name or a path;
+        # without one it picks a profile from the standard location itself.
+        profile="${BROWSER_PROFILE}"
+
+        if [[ "${profile}" == */* ]]; then
+                # An explicit profile path: nothing to locate, just check it.
+                if [[ ! -r "${profile}" ]]; then
+                        die "Browser profile path not readable: ${profile}"
+                fi
+        else
+                root="$(browser_profile_root "${BROWSER}")"
+                if ! profile_is_readable "${root}"; then
+                        warn_no_profile_access "${root}"
+                        return 0
+                fi
+                # Flatpak/Snap roots are invisible to yt-dlp unless passed as a path.
+                if [[ -n "${root}" && "${root}" != "$(browser_profile_standard_root "${BROWSER}")" ]]; then
+                        debug "non-standard profile root: ${root}"
+                        profile="${root}${profile:+/${profile}}"
+                fi
+        fi
+
+        spec="${BROWSER}${profile:+:${profile}}"
+        COOKIE_ARGS=(--cookies-from-browser "${spec}")
+        COOKIE_SOURCE="browser"
+        print_info "Cookies: ${BROWSER} browser profile${profile:+ \"${profile}\"}"
+        return 0                                       # §2 &&-trap
+}
+
+# =============================================================================
+# CORE FUNCTIONS
+# =============================================================================
+
+# Arguments shared by every download mode.
+setup_download_args() {
+        local output_dir="${1}"
+        local template="${2}"
+
+        # --no-mtime: stamp files with the download time, not the upload date.
+        DOWNLOAD_ARGS=(-o "${output_dir}/${template}" --no-mtime --progress)
+        if [[ -n "${RETRIES}" ]]; then
+                DOWNLOAD_ARGS+=(--retries "${RETRIES}")
+        fi
+        return 0                                       # §2 &&-trap
+}
+
+print_failure_hints() {
+        local status="${1}"
+
+        print_error "yt-dlp failed (exit ${status})."
+        if [[ "${COOKIE_SOURCE}" == "browser" ]] && browser_is_running "${BROWSER}"; then
+                print_warning "${BROWSER} is running. If the error mentions 'database is locked', quit it and re-run."
+        fi
+        if [[ "${COOKIE_SOURCE}" == "none" ]]; then
+                print_warning "No cookies were sent. Age-restricted and bot-checked videos need them (see --help, COOKIES)."
+        else
+                print_warning "Age-restricted videos need those cookies to come from a signed-in, age-verified account."
+        fi
+        print_warning "An outdated yt-dlp is the other usual cause: yt-dlp -U (or brew upgrade yt-dlp)"
+        return 0                                       # §2 &&-trap
+}
+
+# Every yt-dlp invocation goes through here so cookies and failure hints are
+# applied uniformly. Returns yt-dlp's exit status.
+run_ytdlp() {
+        local status=0
+
+        debug "yt-dlp ${COOKIE_ARGS[*]+${COOKIE_ARGS[*]}} $*"
+        yt-dlp ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} "$@" || status=$?
+        if [[ "${status}" -ne 0 ]]; then
+                print_failure_hints "${status}"
+        fi
+        return "${status}"
+}
+
+show_formats() {
+        local url="${1}"
+        print_info "Available formats for: ${url}"
+        printf '\n'                                    # §7 printf not echo
+        run_ytdlp -F "${url}"
+        return 0                                       # §2 &&-trap
+}
+
+download_4k() {
+        local url="${1}"
+
+        print_info "Downloading 4K video (up to ${MAX_HEIGHT}p)..."
+        printf '\n'                                    # §7 printf not echo
+        run_ytdlp \
+                -f "bestvideo[height<=${MAX_HEIGHT}]+bestaudio/best[height<=${MAX_HEIGHT}]/best" \
+                --merge-output-format mp4 \
+                "${DOWNLOAD_ARGS[@]}" \
+                "${url}"
+        return 0                                       # §2 &&-trap
+}
+
+download_4k_exact() {
+        local url="${1}"
+
+        print_info "Downloading exact 4K (2160p) video..."
+        printf '\n'                                    # §7 printf not echo
+        run_ytdlp \
+                -f "bestvideo[height=2160]+bestaudio/best[height=2160]" \
+                --merge-output-format mp4 \
+                "${DOWNLOAD_ARGS[@]}" \
+                "${url}"
+        return 0                                       # §2 &&-trap
+}
+
+download_4k_mp4_only() {
+        local url="${1}"
+
+        print_info "Downloading 4K video (MP4 preferred)..."
+        printf '\n'                                    # §7 printf not echo
+        run_ytdlp \
+                -f "bestvideo[height<=${MAX_HEIGHT}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+                --merge-output-format mp4 \
+                "${DOWNLOAD_ARGS[@]}" \
+                "${url}"
+        return 0                                       # §2 &&-trap
+}
+
+# Best video+audio at any resolution, kept in its native container (no mp4
+# remux, no height cap). Falls back to the best combined stream.
+download_best() {
+        local url="${1}"
+
+        print_info "Downloading best available quality..."
+        printf '\n'                                    # §7 printf not echo
+        run_ytdlp \
+                -f "bv*+ba/b" \
+                "${DOWNLOAD_ARGS[@]}" \
+                "${url}"
+        return 0                                       # §2 &&-trap
+}
+
+download_audio() {
+        local url="${1}"
+        local format="${2}"
+
+        print_info "Downloading audio only (${format})..."
+        printf '\n'                                    # §7 printf not echo
+        run_ytdlp \
+                -f "bestaudio" \
+                -x \
+                --audio-format "${format}" \
+                --audio-quality 0 \
+                "${DOWNLOAD_ARGS[@]}" \
+                "${url}"
+        return 0                                       # §2 &&-trap
+}
+
+# =============================================================================
+# USAGE
+# =============================================================================
+
+usage() {
+        cat <<EOF
+Usage: ${0##*/} [OPTIONS] <URL> [OUTPUT_DIR]
+
+Download 4K videos, best-quality videos or audio using yt-dlp.
+Age-restricted YouTube videos work via your browser's cookies.
+
+DOWNLOAD MODES (default: best quality up to ${MAX_HEIGHT}p, merged to MP4):
+    --4k                    The default mode, accepted for explicitness
+    -b, --best              Best quality at any resolution, native container
+    -e, --exact             Download exact 4K (2160p) only, fail if unavailable
+    -m, --mp4               Prefer MP4 format
+    -a, --audio             Download audio only
+    --audio-format FMT      Audio format: mp3, flac, wav, m4a, opus (default: ${AUDIO_FORMAT})
+    -f, --formats           List available formats (no download)
+
+OUTPUT:
+    -o, --output DIR        Output directory (default: ${OUTPUT_DIR})
+                            A second positional argument does the same
+    -i, --id                Add the video ID to the filename: Title [ID].ext
+    --retries N             Retries per download (default: yt-dlp's own, 10)
+
+COOKIES:
+    --browser NAME          Browser to read cookies from (default: ${BROWSER})
+    --profile NAME          Browser profile to read, e.g. Default, "Profile 1",
+                            or a full path to a profile directory
+    --cookies FILE          Use a Netscape cookies.txt instead of the browser
+    --cookies-always        Send browser cookies to any site, not just YouTube
+    --no-cookies            Do not send cookies at all
+
+    -h, --help              Show this help message
+
+ENVIRONMENT VARIABLES:
+    YT4K_OUTPUT_DIR         Default output directory
+    YT4K_OUTPUT_TEMPLATE    yt-dlp filename template (default: %(title)s.%(ext)s)
+    YT4K_MAX_HEIGHT         Maximum video height (default: 2160)
+    YT4K_AUDIO_FORMAT       Default audio format (default: wav)
+    YT4K_RETRIES            Retries per download
+    YT4K_BROWSER            Browser to read cookies from (default: brave)
+    YT4K_BROWSER_PROFILE    Browser profile to read cookies from
+    YT4K_COOKIES            Path to a cookies.txt; skips the browser entirely
+    YT4K_COOKIES_MODE       auto (YouTube only, default) | always | never
+    DEBUG=1                 Print the yt-dlp command line and other details
+
+COOKIES AND AGE-RESTRICTED VIDEOS:
+    YouTube's bot check and age gate need cookies from a logged-in browser.
+    For YouTube URLs these are read from ${BROWSER} automatically, so
+    age-restricted videos download as long as that profile is signed in to
+    an age-verified account. On macOS this requires Full Disk Access for
+    your terminal; without it the download continues without cookies and a
+    warning explains how to fix it. If extraction fails with "database is
+    locked", quit the browser and re-run. On Linux the profile is read
+    from ~/.config (or XDG_CONFIG_HOME), or from a Flatpak or Snap install.
+
+EXAMPLES:
+    ${0##*/} "https://youtube.com/watch?v=VIDEO_ID"
+    ${0##*/} "https://youtube.com/watch?v=VIDEO_ID" ~/Downloads/videos
+    ${0##*/} -b -i "https://youtube.com/watch?v=VIDEO_ID"
+    ${0##*/} -f "https://youtube.com/watch?v=VIDEO_ID"
+    ${0##*/} -e -o ~/Downloads "https://youtube.com/watch?v=VIDEO_ID"
+    ${0##*/} -m "https://youtube.com/watch?v=VIDEO_ID"
+    ${0##*/} -a "https://youtube.com/watch?v=VIDEO_ID"
+    ${0##*/} -a --audio-format flac "https://youtube.com/watch?v=VIDEO_ID"
+    ${0##*/} --profile "Profile 1" "https://youtube.com/watch?v=VIDEO_ID"
+    ${0##*/} --no-cookies "https://youtube.com/watch?v=VIDEO_ID"
+
+EOF
+        return 0                                       # §2 &&-trap
+}
+
+# =============================================================================
+# CLEANUP
+# =============================================================================
+
+cleanup() {
+        debug "cleanup called"
+        return 0                                       # §2 &&-trap
+}
+
+trap 'cleanup' EXIT                                    # §9 trap registered before side effects
+trap 'exit 130' INT TERM                               # stop here on Ctrl-C; EXIT trap still runs
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+        debug "main called"
+        check_requirements                             # §4 first call in main()
+
+        show_banner
+
+        local show_formats_only=false
+        local exact_4k=false
+        local mp4_only=false
+        local best_quality=false
+        local audio_only=false
+        local audio_format="${AUDIO_FORMAT}"
+        local output_dir="${OUTPUT_DIR}"
+        local output_dir_set=false
+        local output_template="${OUTPUT_TEMPLATE}"
+        local url=""
+
+        [[ "${*}" == *"--help"* ]] && { usage; exit 0; }  # §3 --help before loop
+
+        # Parse arguments
+        while [[ $# -gt 0 ]]; do
+                case "${1}" in
+                        -h|--help)
+                                usage
+                                exit 0
+                                ;;
+                        -f|--formats)
+                                show_formats_only=true
+                                shift
+                                ;;
+                        --4k)
+                                shift                  # default mode; accepted for explicitness
+                                ;;
+                        -b|--best)
+                                best_quality=true
+                                shift
+                                ;;
+                        -e|--exact)
+                                exact_4k=true
+                                shift
+                                ;;
+                        -m|--mp4)
+                                mp4_only=true
+                                shift
+                                ;;
+                        -a|--audio)
+                                audio_only=true
+                                shift
+                                ;;
+                        --audio-format)
+                                if [[ -z "${2:-}" ]]; then
+                                        die "Option --audio-format requires an argument"
+                                fi
+                                audio_format="${2}"
+                                shift 2
+                                ;;
+                        -o|--output)
+                                if [[ -z "${2:-}" ]]; then
+                                        die "Option -o requires an argument"
+                                fi
+                                output_dir="${2}"
+                                output_dir_set=true
+                                shift 2
+                                ;;
+                        -i|--id)
+                                output_template="${OUTPUT_TEMPLATE_ID}"
+                                shift
+                                ;;
+                        --retries)
+                                if [[ -z "${2:-}" ]]; then
+                                        die "Option --retries requires an argument"
+                                fi
+                                RETRIES="${2}"
+                                shift 2
+                                ;;
+                        --browser)
+                                if [[ -z "${2:-}" ]]; then
+                                        die "Option --browser requires an argument"
+                                fi
+                                BROWSER="${2}"
+                                shift 2
+                                ;;
+                        --profile)
+                                if [[ -z "${2:-}" ]]; then
+                                        die "Option --profile requires an argument"
+                                fi
+                                BROWSER_PROFILE="${2}"
+                                shift 2
+                                ;;
+                        --cookies)
+                                if [[ -z "${2:-}" ]]; then
+                                        die "Option --cookies requires an argument"
+                                fi
+                                COOKIES_FILE="${2}"
+                                shift 2
+                                ;;
+                        --cookies-always)
+                                USE_COOKIES="always"
+                                shift
+                                ;;
+                        --no-cookies)
+                                USE_COOKIES="never"
+                                shift
+                                ;;
+                        -*)
+                                die "Unknown option: ${1}"
+                                ;;
+                        *)
+                                # First positional is the URL, second the output directory.
+                                if [[ -z "${url}" ]]; then
+                                        url="${1}"
+                                elif [[ "${output_dir_set}" == false ]]; then
+                                        output_dir="${1}"
+                                        output_dir_set=true
+                                else
+                                        die "Unexpected argument: ${1}"
+                                fi
+                                shift
+                                ;;
+                esac
+        done
+
+        # Validate URL
+        if [[ -z "${url}" ]]; then
+                print_error "No URL provided"
+                printf '\n'                            # §7 printf not echo
+                usage
+                exit 1
+        fi
+
+        if ! validate_url "${url}"; then
+                die "Invalid URL: ${url}"
+        fi
+
+        if [[ -n "${RETRIES}" && ! "${RETRIES}" =~ ^([0-9]+|infinite)$ ]]; then
+                die "Invalid retries value: ${RETRIES} (expected a number or 'infinite')"
+        fi
+
+        setup_cookies "${url}"
+
+        if [[ "${show_formats_only}" == true ]]; then
+                show_formats "${url}"
+                return 0
+        fi
+
+        # Create output directory if needed
+        if [[ ! -d "${output_dir}" ]]; then
+                print_info "Creating output directory: ${output_dir}"
+                mkdir -p "${output_dir}"
+        fi
+
+        setup_download_args "${output_dir}" "${output_template}"
+
+        print_info "Downloading: ${url}"
+        print_info "Output directory: ${output_dir}"
+
+        # Execute requested action
+        if [[ "${audio_only}" == true ]]; then
+                download_audio "${url}" "${audio_format}"
+        elif [[ "${exact_4k}" == true ]]; then
+                download_4k_exact "${url}"
+        elif [[ "${mp4_only}" == true ]]; then
+                download_4k_mp4_only "${url}"
+        elif [[ "${best_quality}" == true ]]; then
+                download_best "${url}"
+        else
+                download_4k "${url}"
+        fi
+
+        printf '\n'                                    # §7 printf not echo
+        print_info "Done. Saved to: ${output_dir}"
+        return 0                                       # §2 &&-trap
+}
+
+main "$@"

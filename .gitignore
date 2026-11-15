@@ -1,0 +1,130 @@
+# =============================================================================
+# Secrets — browser cookie exports give full access to your accounts
+# =============================================================================
+cookies.txt
+*cookies*.txt
+*.cookies
+.env
+.env.*
+!.env.example
+
+# =============================================================================
+# Downloaded media (yt4k saves into the current directory by default)
+# =============================================================================
+# Video
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.avi
+*.flv
+*.m4v
+*.ts
+*.3gp
+
+# Audio
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.opus
+*.ogg
+*.aac
+*.wma
+*.aiff
+
+# Subtitles, thumbnails and metadata written by yt-dlp
+*.vtt
+*.srt
+*.ass
+*.lrc
+*.webp
+*.info.json
+*.description
+*.annotations.xml
+*.live_chat.json
+
+# yt-dlp / ffmpeg partial and temporary files
+*.part
+*.part-Frag*
+*.ytdl
+*.temp
+*.temp.*
+*.f[0-9]*.*
+.yt-dlp/
+yt-dlp-archive.txt
+
+# Images are ignored as download by-products, except the project's own
+*.jpg
+*.jpeg
+*.png
+*.gif
+!images/
+!images/**
+
+# =============================================================================
+# Backups, logs and scratch files
+# =============================================================================
+*.bak
+*.orig
+*.rej
+*.old
+*.tmp
+*.log
+*~
+tmp/
+temp/
+
+# =============================================================================
+# Editors and IDEs
+# =============================================================================
+.idea/
+*.iml
+.vscode/
+*.code-workspace
+.fleet/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*.swn
+.netrwhist
+\#*\#
+.\#*
+.project
+.settings/
+
+# =============================================================================
+# AI assistant local state
+# =============================================================================
+.claude/
+CLAUDE.local.md
+
+# =============================================================================
+# macOS
+# =============================================================================
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+Icon?
+
+# =============================================================================
+# Linux
+# =============================================================================
+.directory
+.Trash-*
+.nfs*
+.fuse_hidden*
+
+# =============================================================================
+# Windows
+# =============================================================================
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
